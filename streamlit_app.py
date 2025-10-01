@@ -1,6 +1,9 @@
-# streamlit_app.py (replace your current file with this)
+# streamlit_app.py (FAISS-enabled with lazy model load using MiniLM)
 import streamlit as st
-import os, json, math, random, numpy as np
+import os
+import json
+import random
+import numpy as np
 
 st.set_page_config(page_title="Dr. Anu's Analysis", layout="wide")
 BASE_DIR = os.path.dirname(__file__)
@@ -10,11 +13,11 @@ EMB_FILE = os.path.join(BASE_DIR, "data", "embeddings.npy")
 FAISS_FILE = os.path.join(BASE_DIR, "data", "faiss.index")
 INDEX_MAP = os.path.join(BASE_DIR, "data", "remedies_full_index_map.json")
 
-# Try to import heavier libs only when needed
+# Try to import heavy libs, but tolerate absence
 has_faiss = False
 try:
     import faiss
-    from sentence_transformers import SentenceTransformer, util
+    from sentence_transformers import SentenceTransformer
     has_faiss = True
 except Exception:
     has_faiss = False
@@ -29,7 +32,7 @@ def load_remedies():
 
 remedies = load_remedies()
 
-# Diagnostic info at top (visible to you)
+# Top-level debug info
 st.title("Dr. Anu's Analysis")
 st.caption("Ephemeral processing — complaint text is not stored. Use clinically only with professional judgment.")
 st.markdown("**Debug info:**")
@@ -39,35 +42,46 @@ cols[1].metric("Embeddings file", "Yes" if os.path.exists(EMB_FILE) else "No")
 cols[2].metric("FAISS index", "Yes" if os.path.exists(FAISS_FILE) else "No")
 cols[3].metric("Faiss lib available", str(has_faiss))
 
-# Attempt to load FAISS + model if everything present
-use_faiss = False
+# Attempt to load index & embeddings (but don't load model yet)
 index = None
-model = None
 embeddings = None
 index_map = None
+use_faiss = False
 
 if os.path.exists(EMB_FILE) and os.path.exists(FAISS_FILE) and has_faiss:
     try:
-        # load small mapping if present
+        embeddings = np.load(EMB_FILE)
+        index = faiss.read_index(FAISS_FILE)
         if os.path.exists(INDEX_MAP):
             with open(INDEX_MAP, "r", encoding="utf-8") as f:
                 index_map = json.load(f)
-        embeddings = np.load(EMB_FILE)
-        index = faiss.read_index(FAISS_FILE)
-        model = SentenceTransformer("all-mpnet-base-v2")  # fallback to MiniLM if resource issue
         use_faiss = True
-        st.info("Semantic search mode: FAISS + mpnet (using prebuilt index).")
+        st.info("FAISS index and embeddings found. Model will be loaded lazily when needed (MiniLM).")
     except Exception as e:
-        st.warning(f"Failed to load FAISS/index/model: {e}. Falling back to token scoring.")
+        st.warning(f"Failed to load FAISS/index: {e}. Falling back to token scoring.")
         use_faiss = False
 else:
     st.info("FAISS or embeddings not available — using token-overlap fallback scoring.")
 
-# UI input (ephemeral)
+# Input UI (ephemeral)
 with st.expander("Enter complaint (input hidden after processing)"):
     complaint_text = st.text_area("Paste patient's complaint here (processed ephemerally)", height=240, key="complaint_input")
     analyze = st.button("Process complaint")
 
+# Lazy model holder
+_model = None
+def get_model():
+    global _model
+    if _model is None:
+        try:
+            # MiniLM is smaller and avoids meta-tensor issues on hosted platforms
+            _model = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception as e:
+            st.error(f"Failed to load embedding model: {e}")
+            _model = None
+    return _model
+
+# Scoring helpers
 def token_score(q, text):
     qt = set([t for t in q.lower().split() if len(t)>2])
     if not text:
@@ -77,86 +91,82 @@ def token_score(q, text):
     return s / max(1, len(text_l.split()))
 
 def semantic_search_scores(query, top_k=20):
-    # returns list of dicts: {'idx': int, 'score': float}
-    q_emb = model.encode(query, convert_to_tensor=True)
-    corpus_emb = embeddings  # numpy
-    # use sentence-transformers util if available for cosine
-    try:
-        q_emb_np = q_emb.cpu().numpy().astype("float32")
-        # normalize both
-        faiss.normalize_L2(q_emb_np)
-        faiss.normalize_L2(corpus_emb)
-        D, I = index.search(q_emb_np, top_k)  # inner product since normalized -> cosine
-        results = []
-        for score, idx in zip(D[0], I[0]):
-            if idx < 0:
-                continue
-            results.append({"idx": int(idx), "score": float(score)})
-        return results
-    except Exception as e:
-        st.error(f"Semantic search error: {e}")
+    model = get_model()
+    if model is None or index is None or embeddings is None:
         return []
+    # encode query
+    q_emb = model.encode(query, convert_to_numpy=True).astype("float32")
+    # normalize (FAISS index uses normalized vectors)
+    faiss.normalize_L2(np.expand_dims(q_emb, 0))
+    faiss.normalize_L2(embeddings)
+    D, I = index.search(np.expand_dims(q_emb, 0), top_k)
+    results = []
+    for score, idx in zip(D[0], I[0]):
+        if idx < 0:
+            continue
+        results.append({"idx": int(idx), "score": float(score)})
+    return results
 
 def compute_candidates(complaint):
-    if not complaint or complaint.strip()=="":
+    if not complaint or complaint.strip() == "":
         return []
-    if use_faiss and model is not None and index is not None and embeddings is not None:
-        hits = semantic_search_scores(complaint, top_k=min(50, len(remedies)))
-        # convert hit scores to 0-1 by taking max; they are cosine-like (inner product)
-        if len(hits)==0:
-            return []
-        max_score = max(h['score'] for h in hits) or 1.0
-        results = []
-        seen = set()
-        for h in hits:
-            idx = h['idx']
-            if idx in seen or idx >= len(remedies):
-                continue
-            seen.add(idx)
-            rem = remedies[idx] if idx < len(remedies) else None
-            pct = (h['score'] / max_score) * 100.0
-            # Apply small rubric boost if complaint contains remedy rubrics (increase pct a bit)
-            kb = 0.0
-            for rub in (rem.get("rubrics",[]) if rem else []):
-                if rub.lower() in complaint.lower():
-                    kb += 8.0
-            pct = min(99.9, pct + kb)
-            results.append({"remedy": rem, "percent": round(pct,1), "score": h['score'], "kb": kb})
-        return results
-    else:
-        # fallback token overlap scoring (deterministic)
-        scored = []
-        for r in remedies:
-            s = token_score(complaint, r.get("full_text",""))
-            # minor rubric boost
-            kb = 0.0
-            for rub in r.get("rubrics", []):
-                if rub.lower() in complaint.lower():
-                    kb += 0.02
-            total = 0.7 * s + 0.3 * kb
-            scored.append({"remedy": r, "percent": 0.0, "score": total, "kb": kb})
-        if len(scored)==0:
-            return []
-        maxs = max(item["score"] for item in scored) or 1.0
-        for item in scored:
-            item["percent"] = round((item["score"]/maxs)*100,1)
-        # sort descending
-        scored = sorted(scored, key=lambda x: x["score"], reverse=True)
-        return scored[:50]
+    if use_faiss and _model is not None or (use_faiss and get_model() is not None):
+        model_ok = get_model() is not None
+        if model_ok:
+            hits = semantic_search_scores(complaint, top_k=min(50, len(remedies)))
+            if len(hits) == 0:
+                return []
+            max_score = max(h['score'] for h in hits) or 1.0
+            results = []
+            seen = set()
+            for h in hits:
+                idx = h['idx']
+                if idx in seen or idx >= len(remedies):
+                    continue
+                seen.add(idx)
+                rem = remedies[idx] if idx < len(remedies) else None
+                pct = (h['score'] / max_score) * 100.0
+                kb = 0.0
+                for rub in (rem.get("rubrics",[]) if rem else []):
+                    if rub.lower() in complaint.lower():
+                        kb += 8.0
+                pct = min(99.9, pct + kb)
+                results.append({"remedy": rem, "percent": round(pct,1), "score": h['score'], "kb": kb})
+            return results
+        else:
+            # model failed to load — fallback
+            pass
 
-# Show results area
+    # fallback token-overlap scorer
+    scored = []
+    for r in remedies:
+        s = token_score(complaint, r.get("full_text",""))
+        kb = 0.0
+        for rub in r.get("rubrics", []):
+            if rub.lower() in complaint.lower():
+                kb += 0.02
+        total = 0.7 * s + 0.3 * kb
+        scored.append({"remedy": r, "percent": 0.0, "score": total, "kb": kb})
+    if len(scored) == 0:
+        return []
+    maxs = max(item["score"] for item in scored) or 1.0
+    for item in scored:
+        item["percent"] = round((item["score"]/maxs)*100,1)
+    scored = sorted(scored, key=lambda x: x["score"], reverse=True)
+    return scored[:50]
+
+# Results display and ephemeral handling
 if 'last_results' not in st.session_state:
     st.session_state['last_results'] = None
 
 if 'analyze' in locals() and analyze:
-    if not complaint_text or complaint_text.strip()=="":
+    if not complaint_text or complaint_text.strip() == "":
         st.warning("Please enter a complaint.")
     else:
         results = compute_candidates(complaint_text)
         if not results:
             st.warning("No candidates found. Check ingestion/index or try simpler wording.")
         st.session_state['last_results'] = results
-        # erase input safely
         try:
             if 'complaint_input' in st.session_state:
                 st.session_state['complaint_input'] = ""
@@ -178,7 +188,6 @@ if st.session_state.get('last_results'):
                 st.write('-', c)
         else:
             st.write(content if content else '—')
-    # show detailed descriptive blocks if present, else show full_text
     show_block('Key Characteristics', chosen.get('key_characteristics_desc', chosen.get('key_characteristics', [])))
     show_block('Physical Symptoms', chosen.get('physical_symptoms_desc', chosen.get('physical_symptoms', [])))
     show_block('Mental Symptoms', chosen.get('mental_symptoms_desc', chosen.get('mental_symptoms', [])))
@@ -199,4 +208,4 @@ else:
     st.info("No analysis yet. Enter a complaint and click 'Process complaint' to get suggestions.")
 
 st.markdown("---")
-st.caption("This tool suggests candidate remedies for practitioner review only.")
+st.caption("This tool suggests candidate remedies for practitioner review only. Final prescription is the responsibility of the clinician.")
