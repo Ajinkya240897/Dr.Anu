@@ -6,10 +6,11 @@ Saves data/remedies_full.json
 import os, requests, json, re, time
 from bs4 import BeautifulSoup
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DrAnuBot/1.0; +https://github.com/)"}
+
 SOURCES = [
     "https://homeoint.org/books/kent/index.htm",
     "https://homeoint.org/books/boericmm/index.htm",
-    # Add more public-domain indexes as needed
 ]
 
 OUT_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "remedies_full.json")
@@ -17,12 +18,12 @@ OUT_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "rem
 def fetch(url, tries=3, timeout=20):
     for i in range(tries):
         try:
-            r = requests.get(url, timeout=timeout)
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
             return r.text
         except Exception as e:
             print("fetch error", url, e)
-            time.sleep(1)
+            time.sleep(2)
     return None
 
 def parse_index(index_html, base):
@@ -66,15 +67,24 @@ def main():
         all_links.extend(links)
     all_links = list(dict.fromkeys(all_links))
     print("Total unique links to consider:", len(all_links))
+
     remedies = []
-    for link in all_links:
+    for link in all_links[:100]:  # limit to first 100 links for test (remove limit later)
         html = fetch(link)
         if not html:
             continue
         rem = extract_remedy(html, link)
         if rem:
             remedies.append(rem)
-        time.sleep(0.08)
+        time.sleep(0.1)
+
+    if len(remedies) == 0:
+        print("No remedies fetched, using fallback remedies_master.json")
+        fallback = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "remedies_master.json")
+        if os.path.exists(fallback):
+            with open(fallback, "r", encoding="utf-8") as f:
+                remedies = json.load(f)
+
     os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
     with open(OUT_FILE, "w", encoding="utf-8") as f:
         json.dump(remedies, f, indent=2, ensure_ascii=False)
