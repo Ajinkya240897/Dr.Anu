@@ -1,0 +1,1 @@
+<full build_index code from previous answer>

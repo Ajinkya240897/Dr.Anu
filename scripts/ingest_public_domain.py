@@ -1,0 +1,1 @@
+<full scraper code from previous answer>
