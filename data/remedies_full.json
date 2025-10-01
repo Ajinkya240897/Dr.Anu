@@ -1,0 +1,38 @@
+[
+  {
+    "id": "aconite",
+    "name": "Aconite",
+    "full_text": "Aconite: sudden onset after cold wind; fear; restlessness; fever without sweat; dry cough; better by warmth.",
+    "key_characteristics": [
+      "Sudden onset",
+      "Fear",
+      "Restlessness"
+    ],
+    "key_characteristics_desc": "Abrupt symptoms after chilling exposure; intense fear and agitation.",
+    "physical_symptoms": [
+      "Dry cough",
+      "Fever without sweat"
+    ],
+    "physical_symptoms_desc": "High fever appearing suddenly with dry cough.",
+    "mental_symptoms": [
+      "Fear of death",
+      "Panic"
+    ],
+    "mental_symptoms_desc": "Marked anxiety.",
+    "modalities": {
+      "worse": [
+        "cold wind",
+        "night"
+      ],
+      "better": [
+        "warmth"
+      ]
+    },
+    "thermal": "Warm-seeking",
+    "thermal_desc": "Feels chilly despite fever.",
+    "rubrics": [
+      "Mind - Fear",
+      "Fever - sudden"
+    ]
+  }
+]
